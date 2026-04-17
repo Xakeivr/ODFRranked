@@ -10,6 +10,7 @@ config.json
 
 # Data
 temp/
+.import_tmp_modmail/
 
 ### Python
 # Byte-compiled / optimized / DLL files

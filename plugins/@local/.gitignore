@@ -1,2 +1,6 @@
 *
 !.gitignore
+!ranked/
+!ranked/**
+ranked/__pycache__/
+ranked/**/*.py[cod]
