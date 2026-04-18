@@ -295,6 +295,12 @@ def get_match_status_data(match: dict):
             "label": "Ended"
         }
 
+    if match.get("status") == "finalization_failed":
+        return {
+            "emoji": "âš ï¸",
+            "label": "Finalization Failed"
+        }
+
     if match.get("status") == "cancelled":
         return {
             "emoji": "⚫",
@@ -4117,6 +4123,47 @@ class Ranked(commands.Cog):
 
         return await matches_col.find_one({"_id": match_id}), None
 
+    async def claim_match_finalization(self, match_id: str) -> bool:
+        claimed = await matches_col.update_one(
+            {
+                "_id": match_id,
+                "status": "ongoing",
+                "score_submission": {"$ne": None},
+                "finalization_started_at": {"$exists": False}
+            },
+            {
+                "$set": {
+                    "finalization_started_at": discord.utils.utcnow()
+                }
+            }
+        )
+        return claimed.modified_count > 0
+
+    async def release_match_finalization(self, match_id: str):
+        await matches_col.update_one(
+            {"_id": match_id},
+            {
+                "$unset": {
+                    "finalization_started_at": ""
+                }
+            }
+        )
+
+    async def mark_match_finalization_failed(self, match_id: str, error_message: str):
+        await matches_col.update_one(
+            {"_id": match_id},
+            {
+                "$set": {
+                    "status": "finalization_failed",
+                    "finalization_failed_at": discord.utils.utcnow(),
+                    "finalization_error": error_message[:500]
+                },
+                "$unset": {
+                    "finalization_started_at": ""
+                }
+            }
+        )
+
     async def find_match_for_context(self, ctx, match_id: str | None = None):
         if match_id:
             return await matches_col.find_one({"_id": match_id, "guild_id": ctx.guild.id})
@@ -4972,12 +5019,14 @@ class Ranked(commands.Cog):
             return False, "Your vote could not be updated.", None
 
         if len(votes) >= required_votes:
-            await self.cancel_match_core(
+            cancelled = await self.cancel_match_core(
                 guild,
                 updated_match["_id"],
                 cancelled_by_text="Cancelled by player vote.",
                 score_text="CANCELLED BY VOTE"
             )
+            if not cancelled:
+                return False, "The match could not be cancelled because it is already being finalized.", None
             return True, f"Match cancelled by vote (`{len(votes)}/{required_votes}`).", {
                 "votes": len(votes),
                 "required": required_votes,
@@ -5001,8 +5050,12 @@ class Ranked(commands.Cog):
         if not match:
             return False
 
-        await matches_col.update_one(
-            {"_id": match_id},
+        cancel_result = await matches_col.update_one(
+            {
+                "_id": match_id,
+                "status": "ongoing",
+                "finalization_started_at": {"$exists": False}
+            },
             {
                 "$set": {
                     "status": "cancelled",
@@ -5018,6 +5071,9 @@ class Ranked(commands.Cog):
                 }
             }
         )
+
+        if not cancel_result.modified_count:
+            return False
 
         thread = await self.resolve_thread(guild, match.get("thread_id"))
         if thread:
@@ -6127,6 +6183,29 @@ class Ranked(commands.Cog):
             inline=False
         )
 
+        finalization_started_at = match.get("finalization_started_at")
+        finalization_failed_at = match.get("finalization_failed_at")
+        finalization_error = match.get("finalization_error")
+
+        if finalization_started_at or finalization_failed_at or finalization_error:
+            finalization_lines = []
+            if finalization_started_at:
+                finalization_lines.append(
+                    f"Started: {discord.utils.format_dt(finalization_started_at, style='R')}"
+                )
+            if finalization_failed_at:
+                finalization_lines.append(
+                    f"Failed: {discord.utils.format_dt(finalization_failed_at, style='R')}"
+                )
+            if finalization_error:
+                finalization_lines.append(f"Error: `{finalization_error}`")
+
+            embed.add_field(
+                name="Finalization",
+                value="\n".join(finalization_lines),
+                inline=False
+            )
+
         return embed
 
     async def build_history_embed(self, guild: discord.Guild, target_user_id: int) -> discord.Embed:
@@ -6807,31 +6886,14 @@ class Ranked(commands.Cog):
         await self.update_match_visuals(guild, match_id)
         return True, None
 
-    async def finalize_confirmed_score(self, guild, match_id, channel):
-        match = await matches_col.find_one({"_id": match_id})
-        if not match:
-            await channel.send("Match not found in database.")
-            return
-
-        if match.get("status") != "ongoing":
-            return
-
+    async def _finalize_confirmed_score_claimed(self, guild, match_id, channel, match, submission):
         mode = match["mode"]
         team1 = match["teams"]["team1"]
         team2 = match["teams"]["team2"]
 
-        submission = match.get("score_submission")
-        if not submission:
-            await channel.send("No confirmed score found.")
-            return
-
         team1_score = submission["team1_score"]
         team2_score = submission["team2_score"]
         score_diff = abs(team1_score - team2_score)
-
-        if team1_score == team2_score:
-            await channel.send("Scores cannot be tied.")
-            return
 
         if team1_score > team2_score:
             winners = team1
@@ -7088,6 +7150,440 @@ class Ranked(commands.Cog):
                     "loser": losers,
                     "score": f"{team1_score}-{team2_score}",
                     "confirmation_message_id": None
+                },
+                "$unset": {
+                    "finalization_started_at": "",
+                    "finalization_failed_at": "",
+                    "finalization_error": ""
+                }
+            }
+        )
+
+        team_a_changes = winner_changes if winners == team1 else loser_changes
+        team_b_changes = winner_changes if winners == team2 else loser_changes
+
+        team_a_lines = []
+        for change in team_a_changes:
+            diff_text = f"+{change['diff']}" if change['diff'] >= 0 else str(change['diff'])
+            team_a_lines.append(
+                f"<@{change['user_id']}> â€¢ `{diff_text} MMR` â€¢ {format_rank_progress(change['elo'])}"
+            )
+
+        team_b_lines = []
+        for change in team_b_changes:
+            diff_text = f"+{change['diff']}" if change['diff'] >= 0 else str(change['diff'])
+            team_b_lines.append(
+                f"<@{change['user_id']}> â€¢ `{diff_text} MMR` â€¢ {format_rank_progress(change['elo'])}"
+            )
+
+        result_embed = discord.Embed(
+            title=f"âœ… Match Results â€¢ {match_id}",
+            description="**Match scores confirmed**",
+            color=discord.Color.green()
+        )
+
+        result_embed.add_field(
+            name="Score",
+            value=f"**Team A:** `{team1_score}` â€¢ **Team B:** `{team2_score}`",
+            inline=False
+        )
+
+        result_embed.add_field(
+            name="ðŸ“ˆ Team A MMR Changes" if winners == team1 else "ðŸ“‰ Team A MMR Changes",
+            value="\n".join(team_a_lines) if team_a_lines else "No changes.",
+            inline=False
+        )
+
+        result_embed.add_field(
+            name="ðŸ“ˆ Team B MMR Changes" if winners == team2 else "ðŸ“‰ Team B MMR Changes",
+            value="\n".join(team_b_lines) if team_b_lines else "No changes.",
+            inline=False
+        )
+
+        result_embed.add_field(
+            name="Team A",
+            value=", ".join(f"<@{p}>" for p in team1),
+            inline=False
+        )
+
+        result_embed.add_field(
+            name="Team B",
+            value=", ".join(f"<@{p}>" for p in team2),
+            inline=False
+        )
+
+        result_embed.add_field(
+            name="ðŸ† Winners",
+            value="Team A" if winners == team1 else "Team B",
+            inline=False
+        )
+
+        team_a_placement_lines = []
+        for change in team_a_changes:
+            if change["placement_completed"]:
+                status_text = "Placement complete"
+            else:
+                status_text = f"Placements: {change['placement_status']}/{placement_games}"
+
+            team_a_placement_lines.append(f"<@{change['user_id']}> â€¢ {status_text}")
+
+        team_b_placement_lines = []
+        for change in team_b_changes:
+            if change["placement_completed"]:
+                status_text = "Placement complete"
+            else:
+                status_text = f"Placements: {change['placement_status']}/{placement_games}"
+
+            team_b_placement_lines.append(f"<@{change['user_id']}> â€¢ {status_text}")
+
+        result_embed.add_field(
+            name="ðŸ§­ Team A Placement Status",
+            value="\n".join(team_a_placement_lines) if team_a_placement_lines else "No players.",
+            inline=False
+        )
+
+        result_embed.add_field(
+            name="ðŸ§­ Team B Placement Status",
+            value="\n".join(team_b_placement_lines) if team_b_placement_lines else "No players.",
+            inline=False
+        )
+
+        for user_id in winners + losers:
+            await self.sync_rank_roles_for_user_id(guild, user_id)
+
+        await channel.send(embed=result_embed)
+        await self.update_match_visuals(guild, match_id)
+        await self.update_leaderboard(guild)
+
+    async def finalize_confirmed_score(self, guild, match_id, channel):
+        if not await self.claim_match_finalization(match_id):
+            return
+
+        match = await matches_col.find_one({"_id": match_id})
+        if not match:
+            await self.release_match_finalization(match_id)
+            await channel.send("Match not found in database.")
+            return
+
+        if match.get("status") != "ongoing":
+            await self.release_match_finalization(match_id)
+            return
+
+        mode = match["mode"]
+        team1 = match["teams"]["team1"]
+        team2 = match["teams"]["team2"]
+
+        submission = match.get("score_submission")
+        if not submission:
+            await self.release_match_finalization(match_id)
+            await channel.send("No confirmed score found.")
+            return
+
+        team1_score = submission["team1_score"]
+        team2_score = submission["team2_score"]
+        score_diff = abs(team1_score - team2_score)
+
+        if team1_score == team2_score:
+            await self.release_match_finalization(match_id)
+            await channel.send("Scores cannot be tied.")
+            return
+
+        try:
+            await self._finalize_confirmed_score_claimed(guild, match_id, channel, match, submission)
+        except Exception as exc:
+            error_text = f"{type(exc).__name__}: {exc}"
+            current_match = await matches_col.find_one({"_id": match_id}, {"status": 1})
+            if current_match and current_match.get("status") == "finished":
+                await self.send_ranked_log(
+                    guild,
+                    "âš ï¸ Ranked Finalization Warning",
+                    f"Match `{match_id}` finished, but a post-finalization step failed.",
+                    color=discord.Color.orange(),
+                    fields=[
+                        ("Error", error_text, False),
+                    ]
+                )
+                return
+
+            await self.mark_match_finalization_failed(match_id, error_text)
+            try:
+                await channel.send(
+                    "Match finalization hit an internal error. The match has been locked for staff review."
+                )
+            except discord.HTTPException:
+                pass
+
+            await self.send_ranked_log(
+                guild,
+                "âš ï¸ Ranked Finalization Failed",
+                f"Match `{match_id}` failed during finalization.",
+                color=discord.Color.red(),
+                fields=[
+                    ("Error", error_text, False),
+                ]
+            )
+            return
+
+        return
+
+        if team1_score > team2_score:
+            winners = team1
+            losers = team2
+        else:
+            winners = team2
+            losers = team1
+
+        winner_players = []
+        loser_players = []
+
+        for user_id in winners:
+            player = await self.get_player(user_id)
+            winner_players.append(player)
+
+        for user_id in losers:
+            player = await self.get_player(user_id)
+            loser_players.append(player)
+
+        winner_enemy_avg_elo = 0
+        loser_enemy_avg_elo = 0
+
+        if loser_players:
+            winner_enemy_avg_elo = round(sum(player["elo"] for player in loser_players) / len(loser_players))
+
+        if winner_players:
+            loser_enemy_avg_elo = round(sum(player["elo"] for player in winner_players) / len(winner_players))
+
+        winner_changes = []
+        loser_changes = []
+        placement_games = await self.get_placement_games(guild.id)
+        current_season = await self.get_current_season_number(guild.id)
+        k_factor = await self.get_mode_k_factor(guild.id, mode)
+
+        for user_id, wp in zip(winners, winner_players):
+            old_elo = wp["elo"]
+
+            wp["stats"]["global"]["wins"] += 1
+            wp["stats"]["global"]["matches"] += 1
+            wp["stats"][mode]["wins"] += 1
+            wp["stats"][mode]["matches"] += 1
+
+            winner_streaks = self.normalize_player_streaks(wp)
+            winner_streaks["global"]["current"] += 1
+            winner_streaks["global"]["best"] = max(
+                winner_streaks["global"]["best"],
+                winner_streaks["global"]["current"]
+            )
+
+            winner_streaks[mode]["current"] += 1
+            winner_streaks[mode]["best"] = max(
+                winner_streaks[mode]["best"],
+                winner_streaks[mode]["current"]
+            )
+
+            wp["xp"] += 50
+            wp["history"].append(match_id)
+            wp["history"] = wp["history"][-10:]
+
+            placements = wp.setdefault("placements", {
+                "completed": False,
+                "matches_played": 0,
+                "wins": 0,
+                "losses": 0
+            })
+
+            was_in_placements = not placements.get("completed", False)
+
+            if was_in_placements:
+                placements["matches_played"] += 1
+                placements["wins"] += 1
+
+                if placements["matches_played"] >= placement_games:
+                    placements["completed"] = True
+                    wp["elo"] = calculate_placement_seed(wp, placement_games=placement_games)
+            else:
+                elo_change = calculate_individual_elo_change(
+                    player_elo=old_elo,
+                    enemy_avg_elo=winner_enemy_avg_elo,
+                    won=True,
+                    score_diff=score_diff,
+                    k=k_factor
+                )
+                wp["elo"] += elo_change
+
+            while wp["xp"] >= 100:
+                wp["xp"] -= 100
+                wp["level"] += 1
+
+            new_elo = wp["elo"]
+
+            winner_changes.append({
+                "user_id": user_id,
+                "diff": new_elo - old_elo,
+                "elo": new_elo,
+                "placement_status": wp["placements"]["matches_played"],
+                "placement_completed": wp["placements"]["completed"],
+            })
+
+            self.append_mmr_history_point(wp, wp["elo"], f"Match win {match_id}")
+
+            season_profile = await self.get_season_profile(guild.id, user_id, current_season)
+            season_profile["season_elo"] += max(0, new_elo - old_elo)
+            season_profile["peak_elo"] = max(season_profile.get("peak_elo", 0), season_profile["season_elo"])
+            season_profile["xp"] += 50
+
+            season_profile["stats"]["global"]["wins"] += 1
+            season_profile["stats"]["global"]["matches"] += 1
+            season_profile["stats"][mode]["wins"] += 1
+            season_profile["stats"][mode]["matches"] += 1
+            season_profile["history"].append(match_id)
+            season_profile["history"] = season_profile["history"][-20:]
+
+            season_history = season_profile.setdefault("mmr_history", [])
+            season_history.append({
+                "mmr": season_profile["season_elo"],
+                "games_played": season_profile["stats"]["global"]["matches"],
+                "reason": f"Match win {match_id}",
+                "at": discord.utils.utcnow()
+            })
+            season_profile["mmr_history"] = season_history[-100:]
+
+            self.add_season_quest_metric(season_profile, "daily", "matches_played", 1)
+            self.add_season_quest_metric(season_profile, "weekly", "matches_played", 1)
+            self.add_season_quest_metric(season_profile, "monthly", "matches_played", 1)
+            self.add_season_quest_metric(season_profile, "seasonal", "matches_played", 1)
+
+            self.add_season_quest_metric(season_profile, "daily", "wins", 1)
+            self.add_season_quest_metric(season_profile, "weekly", "wins", 1)
+            self.add_season_quest_metric(season_profile, "monthly", "wins", 1)
+            self.add_season_quest_metric(season_profile, "seasonal", "wins", 1)
+
+            self.update_season_quest_metric(season_profile, "seasonal", "peak_elo", season_profile["peak_elo"])
+
+            while season_profile["xp"] >= 100:
+                season_profile["xp"] -= 100
+                season_profile["level"] += 1
+
+            await self.save_season_profile(season_profile)
+
+            if season_profile.get("team_id"):
+                await self.apply_team_match_result(
+                    guild,
+                    season_profile.get("team_id"),
+                    user_id,
+                    mode,
+                    True,
+                    new_elo - old_elo
+                )
+
+            await players_col.update_one({"_id": user_id}, {"$set": wp})
+
+        for user_id, lp in zip(losers, loser_players):
+            old_elo = lp["elo"]
+
+            lp["stats"]["global"]["losses"] += 1
+            lp["stats"]["global"]["matches"] += 1
+            lp["stats"][mode]["losses"] += 1
+            lp["stats"][mode]["matches"] += 1
+
+            loser_streaks = self.normalize_player_streaks(lp)
+            loser_streaks["global"]["current"] = 0
+            loser_streaks[mode]["current"] = 0
+
+            lp["history"].append(match_id)
+            lp["history"] = lp["history"][-10:]
+
+            placements = lp.setdefault("placements", {
+                "completed": False,
+                "matches_played": 0,
+                "wins": 0,
+                "losses": 0
+            })
+
+            was_in_placements = not placements.get("completed", False)
+
+            if was_in_placements:
+                placements["matches_played"] += 1
+                placements["losses"] += 1
+
+                if placements["matches_played"] >= placement_games:
+                    placements["completed"] = True
+                    lp["elo"] = calculate_placement_seed(lp, placement_games=placement_games)
+            else:
+                elo_change = calculate_individual_elo_change(
+                    player_elo=old_elo,
+                    enemy_avg_elo=loser_enemy_avg_elo,
+                    won=False,
+                    score_diff=score_diff,
+                    k=k_factor
+                )
+                lp["elo"] += elo_change
+
+            new_elo = lp["elo"]
+
+            loser_changes.append({
+                "user_id": user_id,
+                "diff": new_elo - old_elo,
+                "elo": new_elo,
+                "placement_status": lp["placements"]["matches_played"],
+                "placement_completed": lp["placements"]["completed"],
+            })
+
+            self.append_mmr_history_point(lp, lp["elo"], f"Match loss {match_id}")
+
+            season_profile = await self.get_season_profile(guild.id, user_id, current_season)
+            season_profile["season_elo"] = max(0, season_profile.get("season_elo", 0) + min(0, new_elo - old_elo))
+            season_profile["peak_elo"] = max(season_profile.get("peak_elo", 0), season_profile["season_elo"])
+
+            season_profile["stats"]["global"]["losses"] += 1
+            season_profile["stats"]["global"]["matches"] += 1
+            season_profile["stats"][mode]["losses"] += 1
+            season_profile["stats"][mode]["matches"] += 1
+            season_profile["history"].append(match_id)
+            season_profile["history"] = season_profile["history"][-20:]
+
+            season_history = season_profile.setdefault("mmr_history", [])
+            season_history.append({
+                "mmr": season_profile["season_elo"],
+                "games_played": season_profile["stats"]["global"]["matches"],
+                "reason": f"Match loss {match_id}",
+                "at": discord.utils.utcnow()
+            })
+            season_profile["mmr_history"] = season_history[-100:]
+
+            self.add_season_quest_metric(season_profile, "daily", "matches_played", 1)
+            self.add_season_quest_metric(season_profile, "weekly", "matches_played", 1)
+            self.add_season_quest_metric(season_profile, "monthly", "matches_played", 1)
+            self.add_season_quest_metric(season_profile, "seasonal", "matches_played", 1)
+
+            self.update_season_quest_metric(season_profile, "seasonal", "peak_elo", season_profile["peak_elo"])
+
+            await self.save_season_profile(season_profile)
+
+            if season_profile.get("team_id"):
+                await self.apply_team_match_result(
+                    guild,
+                    season_profile.get("team_id"),
+                    user_id,
+                    mode,
+                    False,
+                    new_elo - old_elo
+                )
+
+            await players_col.update_one({"_id": user_id}, {"$set": lp})
+
+        await matches_col.update_one(
+            {"_id": match_id},
+            {
+                "$set": {
+                    "status": "finished",
+                    "finished_at": discord.utils.utcnow(),
+                    "winner": winners,
+                    "loser": losers,
+                    "score": f"{team1_score}-{team2_score}",
+                    "confirmation_message_id": None
+                },
+                "$unset": {
+                    "finalization_started_at": ""
                 }
             }
         )
